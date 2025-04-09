@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import logging
+from scapy.all import *
+from datetime import datetime, timedelta
+import argparse
+import hashlib
+import json
+
+# Security Configuration
+class SecurityConfig:
+    MAX_PACKETS_PER_SECOND = 1000
+    LOG_FILE = "network_sniffer.log"
+    SENSITIVE_PORTS = {80, 443, 21, 22, 23}
+    MAX_PACKET_SIZE = 65535
+    LOG_RETENTION_DAYS = 7
+    ALLOWED_PROTOCOLS = {1, 6, 17}  # ICMP, TCP, UDP
+
+class RateLimiter:
+    def _init_(self, max_packets_per_second):
+        self.max_packets = max_packets_per_second
+        self.packets_count = 0
+        self.last_reset = datetime.now()
+
+    def should_process_packet(self):
+        now = datetime.now()
+        if now - self.last_reset >= timedelta(seconds=1):
+            self.packets_count = 0
+            self.last_reset = now
+        
+        self.packets_count += 1
+        return self.packets_count <= self.max_packets
+
+class PacketSanitizer:
+    @staticmethod
+    def sanitize_packet_data(packet_data):
+        # Remove sensitive information
+        if 'payload' in packet_data:
+            packet_data['payload'] = '<filtered>'
+        return packet_data
+
+    @staticmethod
+    def hash_sensitive_data(data):
+        return hashlib.sha256(str(data).encode()).hexdigest()
+
+class SecureLogger:
+    def _init_(self):
+        logging.basicConfig(
+            filename=SecurityConfig.LOG_FILE,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger('network_sniffer')
+        
+    def log_packet(self, packet_info):
+        sanitized_info = PacketSanitizer.sanitize_packet_data(packet_info)
+        self.logger.info(json.dumps(sanitized_info))
+
+    def log_error(self, error_message):
+        self.logger.error(error_message)
+
+class PacketProcessor:
+    def _init_(self):
+        self.rate_limiter = RateLimiter(SecurityConfig.MAX_PACKETS_PER_SECOND)
+        self.logger = SecureLogger()
+        self.packets_processed = 0
+
+    def process_packet(self, packet):
+        if not self.rate_limiter.should_process_packet():
+            return
+
+        try:
+            if packet.haslayer(IP):
+                packet_info = self._extract_packet_info(packet)
+                if self._validate_packet(packet_info):
+                    self._handle_packet(packet_info)
+                    self.packets_processed += 1
+
+        except Exception as e:
+            self.logger.log_error(f"Error processing packet: {str(e)}")
+
+    def _extract_packet_info(self, packet):
+        return {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'src_ip': packet[IP].src,
+            'dst_ip': packet[IP].dst,
+            'protocol': packet[IP].proto,
+            'size': len(packet),
+            'ports': self._extract_ports(packet)
+        }
+
+    def _extract_ports(self, packet):
+        ports = {}
+        if packet.haslayer(TCP):
+            ports = {
+                'src_port': packet[TCP].sport,
+                'dst_port': packet[TCP].dport
+            }
+        elif packet.haslayer(UDP):
+            ports = {
+                'src_port': packet[UDP].sport,
+                'dst_port': packet[UDP].dport
+            }
+        return ports
+
+    def _validate_packet(self, packet_info):
+        # Size validation
+        if packet_info['size'] > SecurityConfig.MAX_PACKET_SIZE:
+            self.logger.log_error(f"Packet size exceeds maximum: {packet_info['size']}")
+            return False
+
+        # Protocol validation
+        if packet_info['protocol'] not in SecurityConfig.ALLOWED_PROTOCOLS:
+            self.logger.log_error(f"Invalid protocol: {packet_info['protocol']}")
+            return False
+
+        return True
+
+    def _handle_packet(self, packet_info):
+        # Hash sensitive data before logging
+        if 'ports' in packet_info:
+            for port in packet_info['ports'].values():
+                if port in SecurityConfig.SENSITIVE_PORTS:
+                    packet_info['payload'] = PacketSanitizer.hash_sensitive_data(packet_info)
+
+        self.logger.log_packet(packet_info)
+
+def check_privileges():
+    """Check if the script is running with necessary privileges"""
+    if os.name == 'posix' and os.geteuid() != 0:
+        print("Error: This program requires root privileges")
+        sys.exit(1)
+
+def validate_interface(interface_name):
+    """Validate the network interface"""
+    if interface_name:
+        valid_interfaces = get_if_list()
+        if interface_name not in valid_interfaces:
+            raise ValueError(f"Invalid interface: {interface_name}")
+    return interface_name
+
+def cleanup_old_logs():
+    """Remove logs older than LOG_RETENTION_DAYS"""
+    try:
+        log_file = SecurityConfig.LOG_FILE
+        if os.path.exists(log_file):
+            file_time = datetime.fromtimestamp(os.path.getmtime(log_file))
+            if datetime.now() - file_time > timedelta(days=SecurityConfig.LOG_RETENTION_DAYS):
+                os.remove(log_file)
+    except Exception as e:
+        print(f"Error during log cleanup: {e}")
+
+def main():
+    try:
+        # Check privileges first
+        check_privileges()
+        
+        # Clean up old logs
+        cleanup_old_logs()
+
+        # Parse arguments
+        parser = argparse.ArgumentParser(description='Secure Network Sniffer')
+        parser.add_argument('-i', '--interface', 
+                          help='Network interface to capture packets from',
+                          default=None)
+        parser.add_argument('-c', '--count',
+                          help='Number of packets to capture (0 for infinite)',
+                          type=int,
+                          default=0)
+        args = parser.parse_args()
+
+        # Validate interface
+        interface = validate_interface(args.interface)
+
+        # Initialize packet processor
+        processor = PacketProcessor()
+
+        print("Starting secure network sniffer...")
+        print("Press Ctrl+C to stop")
+        print("-" * 50)
+
+        # Start sniffing with security measures
+        sniff(iface=interface,
+              prn=processor.process_packet,
+              count=args.count,
+              store=0)
+
+    except KeyboardInterrupt:
+        print("\nSniffing stopped by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"An error occurred. Check logs for details.")
+        logging.error(f"Critical error: {str(e)}")
+        sys.exit(1)
+
+if _name_ == "_main_":
+    main()

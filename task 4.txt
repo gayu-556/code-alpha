@@ -1,0 +1,92 @@
+from scapy.all import *
+import time
+from collections import defaultdict
+import json
+from datetime import datetime
+
+class NetworkIDS:
+    def _init_(self):
+        self.alerts = []
+        self.alert_counts = defaultdict(int)
+        self.rules = [
+            {
+                'name': 'Port Scan',
+                'condition': lambda pkt: TCP in pkt and pkt[TCP].flags == 'S',
+                'threshold': {'count': 5, 'seconds': 60}
+            },
+            {
+                'name': 'SQL Injection',
+                'condition': lambda pkt: TCP in pkt and Raw in pkt and 
+                                      b'SELECT' in pkt[Raw].load and 
+                                      b'FROM' in pkt[Raw].load,
+                'threshold': {'count': 1, 'seconds': 1}
+            },
+            {
+                'name': 'XSS Attack',
+                'condition': lambda pkt: TCP in pkt and Raw in pkt and 
+                                      b'<script>' in pkt[Raw].load,
+                'threshold': {'count': 1, 'seconds': 1}
+            }
+        ]
+        self.source_counts = defaultdict(lambda: defaultdict(int))
+        self.last_reset = time.time()
+
+    def process_packet(self, packet):
+        current_time = time.time()
+        
+        # Reset counters if threshold period has passed
+        if current_time - self.last_reset > 60:
+            self.source_counts.clear()
+            self.last_reset = current_time
+
+        if IP in packet:
+            src_ip = packet[IP].src
+            dst_ip = packet[IP].dst
+            
+            for rule in self.rules:
+                if rule['condition'](packet):
+                    self.source_counts[src_ip][rule['name']] += 1
+                    
+                    if self.source_counts[src_ip][rule['name']] >= rule['threshold']['count']:
+                        alert = {
+                            'timestamp': datetime.now().isoformat(),
+                            'alert_type': rule['name'],
+                            'source_ip': src_ip,
+                            'destination_ip': dst_ip,
+                            'protocol': packet[IP].proto
+                        }
+                        
+                        self.alerts.append(alert)
+                        self.alert_counts[rule['name']] += 1
+                        
+                        print(f"\n[ALERT] {rule['name']} detected!")
+                        print(f"Source: {src_ip}")
+                        print(f"Destination: {dst_ip}")
+                        print(f"Time: {alert['timestamp']}")
+                        print("-" * 50)
+
+    def save_alerts(self):
+        with open('alerts.json', 'w') as f:
+            json.dump(self.alerts, f, indent=4)
+
+def main():
+    print("Starting Network Intrusion Detection System...")
+    print("Press Ctrl+C to stop")
+    print("-" * 50)
+    
+    ids = NetworkIDS()
+    
+    try:
+        # Start packet sniffing
+        sniff(prn=ids.process_packet, store=0)
+    except KeyboardInterrupt:
+        print("\nStopping NIDS...")
+        ids.save_alerts()
+        print("Alerts saved to alerts.json")
+        print(f"Total alerts detected: {len(ids.alerts)}")
+        print("Alert types and counts:")
+        for alert_type, count in ids.alert_counts.items():
+            print(f"{alert_type}: {count}")
+
+if _name_ == "_main_":
+    main()
